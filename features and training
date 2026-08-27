@@ -1,0 +1,200 @@
+%% ================== REM vs NREM CLASSIFICATION ==================
+rng(1);
+rem_folder  = 'C:\Users\amrit\Downloads\Zhang & Wamsley 2019\Zhang & Wamsley 2019\Data\PSG\CHANLOTED\REM';
+nrem_folder = 'C:\Users\amrit\Downloads\Zhang & Wamsley 2019\Zhang & Wamsley 2019\Data\PSG\CHANLOTED\NREM';
+nfft = 2048; window = hamming(nfft); noverlap = nfft/2;
+target_chans = {'Fc1-REF','C3-REF','C1-REF','Cp3-REF','Cp2-REF','Po3-REF','Cz-REF','P4-REF'};
+bands={ [0.5 4], [4 8], [8 13], [13 30], [30 50] };
+spindle_b = [11 16];
+fprintf('Extracting features...\n');
+[X_nrem,~,G_nrem] = extract_enhanced_features(nrem_folder,nfft,window,noverlap,bands,spindle_b,target_chans);
+[X_rem,~,G_rem]   = extract_enhanced_features(rem_folder,nfft,window,noverlap,bands,spindle_b,target_chans);
+X = [X_nrem; X_rem];
+Y = [repmat(categorical("NREM"),size(X_nrem,1),1); repmat(categorical("REM"),size(X_rem,1),1)];
+Groups = [G_nrem; G_rem];
+X(isnan(X))=0; X(isinf(X))=0;
+X = log1p(abs(X));
+numFeatures = size(X,2);
+
+%% ================== SUBJECT-INDEPENDENT CV ==================
+unique_subjects = unique(Groups);
+num_subj = numel(unique_subjects);
+K = min(5,num_subj);
+cv_subj = cvpartition(num_subj,'KFold',K);
+accK=zeros(K,1); f1K=zeros(K,1); kappaK=zeros(K,1);
+fprintf('\nStarting CV...\n');
+for k=1:K
+    fprintf('\n=== Fold %d ===\n',k);
+    
+    train_subjects = unique_subjects(training(cv_subj,k));
+    test_subjects  = unique_subjects(test(cv_subj,k));
+    trainIdx = ismember(Groups,train_subjects);
+    testIdx  = ismember(Groups,test_subjects);
+    XTrain_Raw = X(trainIdx,:);
+    YTrain = Y(trainIdx);
+    XTest_Raw = X(testIdx,:);
+    YTest = Y(testIdx);
+    TrainGroups = Groups(trainIdx);
+    
+    rem_count   = sum(YTrain=="REM");
+    nrem_count  = sum(YTrain=="NREM");
+    if rem_count > nrem_count
+        nrem_idx = find(YTrain=="NREM");
+        extra_needed = rem_count - nrem_count;
+        synth_idx = randsample(nrem_idx,extra_needed,true);
+        jitter = 0.1*randn(extra_needed,numFeatures);
+        XTrain_Raw = [XTrain_Raw; XTrain_Raw(synth_idx,:) + jitter];
+        YTrain = [YTrain; repmat(categorical("NREM"),extra_needed,1)];
+        TrainGroups = [TrainGroups; TrainGroups(synth_idx)];
+    end
+    
+    XTrain = normalize_by_subject(XTrain_Raw,TrainGroups);
+    XTest  = normalize_by_subject(XTest_Raw,Groups(testIdx));
+    
+    layers=[ 
+        featureInputLayer(numFeatures,'Normalization','none')
+        fullyConnectedLayer(512); batchNormalizationLayer; reluLayer; dropoutLayer(0.4)
+        fullyConnectedLayer(256); batchNormalizationLayer; reluLayer; dropoutLayer(0.3)
+        fullyConnectedLayer(128); batchNormalizationLayer; reluLayer; dropoutLayer(0.2)
+        fullyConnectedLayer(2); softmaxLayer; classificationLayer
+    ];
+    options=trainingOptions('adam', ...
+        'MaxEpochs',80,'MiniBatchSize',32,'Verbose',false);
+    net = trainNetwork(XTrain,YTrain,layers,options);
+    YPred = classify(net,XTest);
+    
+    accK(k) = mean(YPred==YTest);
+    cm = confusionmat(YTest,YPred,'Order',categories(YTest));
+    precision = diag(cm)./(sum(cm,1)'+eps);
+    recall    = diag(cm)./(sum(cm,2)+eps);
+    f1K(k) = mean(2*(precision.*recall)./(precision+recall+eps));
+    kappaK(k) = cohen_kappa(cm);
+    fprintf('Acc=%.2f%% | F1=%.3f | Kappa=%.3f\n', ...
+        accK(k)*100,f1K(k),kappaK(k));
+    
+    if k==K
+        final_net = net;
+        final_testIdx = testIdx;
+    end
+end
+fprintf('\nFINAL:\n');
+fprintf('Accuracy: %.2f ± %.2f\n',mean(accK)*100,std(accK)*100);
+fprintf('F1: %.3f ± %.3f\n',mean(f1K),std(f1K));
+fprintf('Kappa: %.3f ± %.3f\n',mean(kappaK),std(kappaK));
+
+%% ================== PERMUTATION IMPORTANCE ==================
+fprintf('\nCalculating Permutation Importance...\n');
+XTest = X(final_testIdx,:);
+YTest = Y(final_testIdx);
+GTest = Groups(final_testIdx);
+XTest = normalize_by_subject(XTest, GTest);
+scores_base = predict(final_net, XTest);
+target_idx = double(YTest); 
+calc_loss = @(s) -mean(log(s(sub2ind(size(s), (1:size(s,1))', target_idx)) + eps));
+baseline_loss = calc_loss(scores_base);
+importance = zeros(numFeatures,1);
+for feat = 1:numFeatures
+    X_p = XTest;
+    X_p(:,feat) = XTest(randperm(size(XTest,1)), feat);
+    importance(feat) = calc_loss(predict(final_net, X_p)) - baseline_loss;
+end
+importance(importance < 0) = 0;
+
+%% ================== FIXED BLACK PLOT (CORRECT LABELS) ==================
+[imp_sorted, idx_sorted] = sort(importance,'descend');
+top_n = min(10, numFeatures);
+feat_types = {'DeltaPow','ThetaPow','AlphaPow','BetaPow','GammaPow','SpecEnt','SpecVar','SpinPow','SpinEnt','SpinEnt2','SpinDE'};
+feat_labels = {};
+for c = 1:numel(target_chans)
+    for f = 1:11
+        feat_labels{end+1} = sprintf('%s %s', feat_types{f}, target_chans{c});
+    end
+end
+figure('Units','centimeters','Position',[2 2 22 16],'Color','w'); clf;
+b = bar(imp_sorted(1:top_n), ...
+    'BarWidth',0.75, 'FaceColor',[0.15 0.15 0.15], 'EdgeColor','k', 'LineWidth',1.2);
+current_labels = feat_labels(idx_sorted(1:top_n));
+current_labels = strrep(current_labels, '-REF', '');
+ax = gca;
+set(ax,'XTick',1:top_n, 'XTickLabel',current_labels, 'XTickLabelRotation',35, ...
+    'FontSize',14, 'FontName','Arial', 'LineWidth',1, 'Box','off');
+ylabel('\Delta Loss (Importance)','FontSize',16,'FontWeight','bold');
+title('REM vs. NREM Feature Importance','FontSize',16);
+grid on; grid minor; set(gca,'Layer','top');
+yl = ylim;
+for i = 1:top_n
+    text(i, imp_sorted(i) + 0.03*(yl(2)-yl(1)), sprintf('%.4f',imp_sorted(i)), ...
+        'HorizontalAlignment','center', 'VerticalAlignment','bottom', ...
+        'FontSize',13,'FontWeight','bold');
+end
+set(gca,'Units','normalized');
+ti = ax.TightInset;
+ax.Position = [ti(1) ti(2) 1-ti(1)-ti(3) 1-ti(2)-ti(4)];
+
+%% ================== FUNCTIONS ==================
+function X_norm=normalize_by_subject(X_raw,G)
+    X_norm=zeros(size(X_raw));
+    subs=unique(G);
+    for i=1:numel(subs)
+        idx=ismember(G,subs(i));
+        d=X_raw(idx,:);
+        mu=mean(d); sd=std(d); sd(sd==0)=1;
+        X_norm(idx,:)=(d-mu)./sd;
+    end
+end
+
+function kappa=cohen_kappa(cm)
+    n=sum(cm(:));
+    p0=trace(cm)/n;
+    row_totals=sum(cm,2);
+    col_totals=sum(cm,1);
+    pe=sum(row_totals.*col_totals)/n^2;
+    kappa=(p0-pe)/(1-pe+eps);
+end
+
+function [feat_matrix,actual_chans,group_ids]=extract_enhanced_features(folder_path,nfft,window,noverlap,bands,spindle_b,chan_list)
+    files_info=dir(fullfile(folder_path,'*.set')); file_list={files_info.name};
+    feat_matrix=[]; group_ids={}; actual_chans={};
+    
+    for i=1:numel(file_list)
+        try 
+            EEG=pop_loadset('filename',file_list{i},'filepath',folder_path); 
+        catch; continue; end
+        parts=split(file_list{i},'_'); current_id=parts{1};
+        fs=EEG.srate;
+        [~,chan_inds]=intersect(lower({EEG.chanlocs.labels}),lower(chan_list),'stable');
+        if isempty(chan_inds), continue; end
+        
+        file_feats=[];
+        for c=1:numel(chan_inds)
+            signal=double(EEG.data(chan_inds(c),:));
+            if length(signal)<nfft, continue; end
+            [S,F,~]=spectrogram(signal,window,noverlap,nfft,fs);
+            Pxx=abs(S).^2; valid=(F>=0.5 & F<=50);
+            total=sum(Pxx(valid,:),1)+eps;
+            rp=@(b) mean(Pxx(F>=b(1)&F<=b(2),:),1)./total;
+            feats=[mean(rp(bands{1})), mean(rp(bands{2})), mean(rp(bands{3})), ...
+                   mean(rp(bands{4})), mean(rp(bands{5})), ...
+                   mean(-sum((Pxx(valid,:)./total).*log2(Pxx(valid,:)./total+eps),1)), ...
+                   mean(var(Pxx(valid,:),0,1))];
+            spin_pow=mean(Pxx(F>=spindle_b(1)&F<=spindle_b(2),:),1)./total;
+            spin_ent=-spin_pow.*log2(spin_pow+eps); spin_ent(isnan(spin_ent))=0;
+            feats=[feats, mean(spin_pow), mean(spin_ent), mean(spin_ent.^2)];
+            spin_mask = F>=spindle_b(1) & F<=spindle_b(2);
+            spin_pxx = Pxx(spin_mask,:);
+            if size(spin_pxx,1)>0
+                spin_var=var(spin_pxx,0,1);
+                spindle_de=0.5*log(2*pi*exp(1)) + 0.5*log(spin_var+eps);
+                feats=[feats, mean(spindle_de)];
+            else
+                feats=[feats,0];
+            end
+            file_feats=[file_feats, feats(:)'];
+        end
+        
+        if ~isempty(file_feats)
+            feat_matrix=[feat_matrix; file_feats];
+            group_ids=[group_ids; repmat({current_id},size(file_feats,1),1)];
+        end
+    end
+end
