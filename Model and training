@@ -1,0 +1,425 @@
+rng(1);
+
+rem_folder  = 'C:\Users\amrit\Downloads\Zhang & Wamsley 2019\Zhang & Wamsley 2019\Data\PSG\CHANLOTED\REM';
+nrem_folder = 'C:\Users\amrit\Downloads\Zhang & Wamsley 2019\Zhang & Wamsley 2019\Data\PSG\CHANLOTED\NREM';
+
+nfft = 2048;
+window = hamming(nfft);
+noverlap = nfft / 2;
+
+target_chans = {'Fc1-REF','C3-REF','C1-REF','Cp3-REF', ...
+                'Cp2-REF','Po3-REF','Cz-REF','P4-REF'};
+
+bands = {[0.5 4],[4 8],[8 13],[13 30],[30 50]};
+spindle_b = [11 16];
+
+fprintf('Extracting features...\n');
+
+[X_nrem,~,G_nrem] = extract_enhanced_features( ...
+    nrem_folder,nfft,window,noverlap,bands,spindle_b,target_chans);
+
+[X_rem,~,G_rem] = extract_enhanced_features( ...
+    rem_folder,nfft,window,noverlap,bands,spindle_b,target_chans);
+
+if isempty(X_nrem) || isempty(X_rem)
+    error('Feature extraction failed. Check folders, files, EEGLAB, and channel labels.');
+end
+
+X = [X_nrem; X_rem];
+
+Y = [repmat(categorical("NREM"),size(X_nrem,1),1); ...
+     repmat(categorical("REM"), size(X_rem,1),1)];
+
+Groups = [G_nrem; G_rem];
+
+X(isnan(X)) = 0;
+X(isinf(X)) = 0;
+X = log1p(abs(X));
+
+numFeatures = size(X,2);
+numClasses = numel(categories(Y));
+
+fprintf('NREM samples: %d\n',size(X_nrem,1));
+fprintf('REM samples: %d\n',size(X_rem,1));
+fprintf('Total samples: %d\n',size(X,1));
+fprintf('Subjects: %d\n',numel(unique(Groups)));
+fprintf('Features: %d\n',numFeatures);
+
+unique_subjects = unique(Groups);
+K = min(5,numel(unique_subjects));
+
+if K < 2
+    error('At least two unique subjects are required for subject-independent CV.');
+end
+
+cv_subj = cvpartition(numel(unique_subjects),'KFold',K);
+
+accK = nan(K,1);
+f1K = nan(K,1);
+kappaK = nan(K,1);
+
+layers = [
+    featureInputLayer(numFeatures,'Normalization','none')
+    fullyConnectedLayer(512)
+    batchNormalizationLayer
+    reluLayer
+    dropoutLayer(0.4)
+    fullyConnectedLayer(256)
+    batchNormalizationLayer
+    reluLayer
+    dropoutLayer(0.3)
+    fullyConnectedLayer(128)
+    batchNormalizationLayer
+    reluLayer
+    dropoutLayer(0.2)
+    fullyConnectedLayer(numClasses)
+    softmaxLayer
+    classificationLayer
+];
+
+options = trainingOptions('adam', ...
+    'MaxEpochs',80, ...
+    'MiniBatchSize',32, ...
+    'InitialLearnRate',1e-3, ...
+    'LearnRateSchedule','piecewise', ...
+    'LearnRateDropFactor',0.5, ...
+    'LearnRateDropPeriod',30, ...
+    'L2Regularization',0.005, ...
+    'Shuffle','every-epoch', ...
+    'Verbose',false, ...
+    'Plots','none');
+
+for k = 1:K
+
+    train_subjects = unique_subjects(training(cv_subj,k));
+    test_subjects = unique_subjects(test(cv_subj,k));
+
+    trainIdx = ismember(Groups,train_subjects);
+    testIdx = ismember(Groups,test_subjects);
+
+    XTrain_Raw = X(trainIdx,:);
+    YTrain = Y(trainIdx);
+    TrainGroups = Groups(trainIdx);
+
+    XTest_Raw = X(testIdx,:);
+    YTest = Y(testIdx);
+    TestGroups = Groups(testIdx);
+
+    [XTrain_Raw,YTrain,TrainGroups] = balance_training_data( ...
+        XTrain_Raw,YTrain,TrainGroups,"REM","NREM",numFeatures);
+
+    XTrain = normalize_by_subject(XTrain_Raw,TrainGroups);
+    XTest = normalize_by_subject(XTest_Raw,TestGroups);
+
+    net = trainNetwork(XTrain,YTrain,layers,options);
+    YPred = classify(net,XTest);
+
+    [accK(k),f1K(k),kappaK(k),cm] = classification_metrics(YTest,YPred);
+
+    fprintf('Fold %d/%d: Acc = %.2f%% | F1 = %.4f | Kappa = %.4f\n', ...
+        k,K,accK(k)*100,f1K(k),kappaK(k));
+
+end
+
+fprintf('\nREM vs NREM results\n');
+fprintf('Accuracy: %.2f ± %.2f %%\n',mean(accK,'omitnan')*100,std(accK,'omitnan')*100);
+fprintf('F1 score: %.4f ± %.4f\n',mean(f1K,'omitnan'),std(f1K,'omitnan'));
+fprintf('Kappa: %.4f ± %.4f\n',mean(kappaK,'omitnan'),std(kappaK,'omitnan'));
+
+results_rem_nrem = table((1:K)',accK*100,f1K,kappaK, ...
+    'VariableNames',{'Fold','Accuracy_pct','F1_Score','Kappa'});
+
+writetable(results_rem_nrem,'SPCOM_REM_NREM_SpindleDE_results.csv');
+
+k = K;
+
+train_subjects = unique_subjects(training(cv_subj,k));
+test_subjects = unique_subjects(test(cv_subj,k));
+
+trainIdx = ismember(Groups,train_subjects);
+testIdx = ismember(Groups,test_subjects);
+
+XTrain_Raw = X(trainIdx,:);
+YTrain = Y(trainIdx);
+TrainGroups = Groups(trainIdx);
+
+XTest_Raw = X(testIdx,:);
+YTest = Y(testIdx);
+TestGroups = Groups(testIdx);
+
+[XTrain_Raw,YTrain,TrainGroups] = balance_training_data( ...
+    XTrain_Raw,YTrain,TrainGroups,"REM","NREM",numFeatures);
+
+XTrain = normalize_by_subject(XTrain_Raw,TrainGroups);
+XTest = normalize_by_subject(XTest_Raw,TestGroups);
+
+final_net_rem_nrem = trainNetwork(XTrain,YTrain,layers,options);
+
+YPred_base = classify(final_net_rem_nrem,XTest);
+[~,baseline_f1,~,~] = classification_metrics(YTest,YPred_base);
+
+fprintf('\nFold-%d permutation baseline F1: %.4f\n',k,baseline_f1);
+
+feat_types = {'Delta','Theta','Alpha','Beta','Gamma', ...
+              'SpecEnt','SpecVar','SpinPow','SpinEnt', ...
+              'SpinEnt2','SpindleDE'};
+
+feature_names_rem_nrem = cell(numFeatures,1);
+
+for ch = 1:numel(target_chans)
+    for f = 1:numel(feat_types)
+        feature_names_rem_nrem{(ch-1)*numel(feat_types)+f} = ...
+            sprintf('%s_%s',feat_types{f},target_chans{ch});
+    end
+end
+
+n_repeats = 10;
+importance_rem_nrem = zeros(numFeatures,1);
+
+for feat = 1:numFeatures
+
+    f1_drops = zeros(n_repeats,1);
+
+    for r = 1:n_repeats
+
+        XTest_perm = XTest;
+        permuted_rows = randperm(size(XTest,1));
+        XTest_perm(:,feat) = XTest(permuted_rows,feat);
+
+        YPred_perm = classify(final_net_rem_nrem,XTest_perm);
+        [~,f1_perm,~,~] = classification_metrics(YTest,YPred_perm);
+
+        f1_drops(r) = baseline_f1 - f1_perm;
+
+    end
+
+    importance_rem_nrem(feat) = mean(f1_drops);
+
+end
+
+[imp_sorted_rem,idx_sorted_rem] = sort(importance_rem_nrem,'descend');
+
+imp_table_rem_nrem = table( ...
+    (1:numFeatures)', ...
+    importance_rem_nrem, ...
+    feature_names_rem_nrem, ...
+    'VariableNames',{'FeatureIdx','DeltaF1','FeatureName'});
+
+imp_table_rem_nrem = imp_table_rem_nrem(idx_sorted_rem,:);
+
+writetable(imp_table_rem_nrem,'REM_NREM_feature_importance_table.csv');
+
+top_n = min(8,numFeatures);
+top_labels = feature_names_rem_nrem(idx_sorted_rem(1:top_n));
+
+figure('Color','w','Position',[200 200 1000 600]);
+bar(imp_sorted_rem(1:top_n), ...
+    'FaceColor',[0.10 0.10 0.10], ...
+    'EdgeColor','k', ...
+    'LineWidth',1.2);
+
+set(gca, ...
+    'XTick',1:top_n, ...
+    'XTickLabel',top_labels, ...
+    'XTickLabelRotation',45, ...
+    'FontSize',11, ...
+    'Box','off');
+
+ylabel('\DeltaF1 score drop');
+title('REM vs NREM Feature Importance');
+grid on;
+
+yl = ylim;
+
+for i = 1:top_n
+    text(i,imp_sorted_rem(i) + 0.02*(yl(2)-yl(1)), ...
+        sprintf('%.4f',imp_sorted_rem(i)), ...
+        'HorizontalAlignment','center', ...
+        'VerticalAlignment','bottom', ...
+        'FontSize',10);
+end
+
+print(gcf,'REM_NREM_feature_importance.png','-dpng','-r300');
+
+fprintf('Saved: SPCOM_REM_NREM_SpindleDE_results.csv\n');
+fprintf('Saved: REM_NREM_feature_importance_table.csv\n');
+fprintf('Saved: REM_NREM_feature_importance.png\n');
+
+function [feat_matrix,actual_chans,group_ids] = extract_enhanced_features( ...
+    folder_path,nfft,window,noverlap,bands,spindle_b,chan_list)
+
+    files_info = dir(fullfile(folder_path,'*.set'));
+    file_list = {files_info.name};
+
+    feat_matrix = [];
+    group_ids = {};
+    actual_chans = {};
+
+    for i = 1:numel(file_list)
+
+        try
+            EEG = pop_loadset('filename',file_list{i},'filepath',folder_path);
+        catch
+            warning('Could not load: %s',file_list{i});
+            continue;
+        end
+
+        if isempty(EEG.chanlocs) || size(EEG.data,2) < nfft
+            continue;
+        end
+
+        parts = split(file_list{i},'_');
+        current_id = parts{1};
+        fs = EEG.srate;
+
+        all_labels = {EEG.chanlocs.labels};
+        [~,chan_inds] = intersect(lower(all_labels),lower(chan_list),'stable');
+
+        if isempty(chan_inds)
+            continue;
+        end
+
+        file_feats = [];
+
+        for c = 1:numel(chan_inds)
+
+            signal = double(EEG.data(chan_inds(c),:));
+
+            [S,F,~] = spectrogram(signal,window,noverlap,nfft,fs);
+
+            if isempty(S)
+                continue;
+            end
+
+            Pxx = abs(S).^2;
+
+            valid = F >= 0.5 & F <= 50;
+            total = sum(Pxx(valid,:),1) + eps;
+
+            rp = @(b) mean(Pxx(F >= b(1) & F <= b(2),:),1) ./ total;
+
+            delta = mean(rp(bands{1}));
+            theta = mean(rp(bands{2}));
+            alpha = mean(rp(bands{3}));
+            beta = mean(rp(bands{4}));
+            gamma = mean(rp(bands{5}));
+
+            Pvalid = Pxx(valid,:) ./ total;
+            spec_entropy = mean(-sum(Pvalid .* log2(Pvalid + eps),1));
+
+            spec_var = mean(var(Pxx(valid,:),0,1));
+
+            spin_mask = F >= spindle_b(1) & F <= spindle_b(2);
+            spin_pxx = Pxx(spin_mask,:);
+
+            spin_pow = mean(mean(spin_pxx,1) ./ total);
+
+            spin_rel = mean(spin_pxx,1) ./ total;
+            spin_ent = -spin_rel .* log2(spin_rel + eps);
+            spin_ent(isnan(spin_ent)) = 0;
+
+            spin_ent_mean = mean(spin_ent);
+            spin_ent_sq = mean(spin_ent.^2);
+
+            spin_var = var(spin_pxx,0,1);
+            spindle_de = mean(0.5 * log(2*pi*exp(1) * (spin_var + eps)));
+
+            feats = [delta,theta,alpha,beta,gamma, ...
+                     spec_entropy,spec_var,spin_pow, ...
+                     spin_ent_mean,spin_ent_sq,spindle_de];
+
+            file_feats = [file_feats,feats];
+
+            actual_chans{end+1} = EEG.chanlocs(chan_inds(c)).labels;
+
+        end
+
+        if ~isempty(file_feats)
+            feat_matrix = [feat_matrix;file_feats];
+            group_ids = [group_ids;repmat({current_id},size(file_feats,1),1)];
+        end
+
+    end
+end
+
+function [X_balanced,Y_balanced,G_balanced] = balance_training_data( ...
+    X_raw,Y_raw,G_raw,class_a,class_b,numFeatures)
+
+    X_balanced = X_raw;
+    Y_balanced = Y_raw;
+    G_balanced = G_raw;
+
+    count_a = sum(Y_raw == class_a);
+    count_b = sum(Y_raw == class_b);
+
+    if count_a == count_b
+        return;
+    end
+
+    if count_a < count_b
+
+        minority_class = class_a;
+        majority_count = count_b;
+
+    else
+
+        minority_class = class_b;
+        majority_count = count_a;
+
+    end
+
+    minority_idx = find(Y_raw == minority_class);
+    extra_needed = majority_count - numel(minority_idx);
+
+    sampled_idx = randsample(minority_idx,extra_needed,true);
+    jitter = 0.1 * randn(extra_needed,numFeatures);
+
+    X_synth = X_raw(sampled_idx,:) + jitter;
+    Y_synth = repmat(categorical(minority_class),extra_needed,1);
+    G_synth = G_raw(sampled_idx);
+
+    X_balanced = [X_raw;X_synth];
+    Y_balanced = [Y_raw;Y_synth];
+    G_balanced = [G_raw;G_synth];
+
+end
+
+function X_norm = normalize_by_subject(X_raw,G)
+
+    X_norm = zeros(size(X_raw));
+    subs = unique(G);
+
+    for i = 1:numel(subs)
+
+        idx = ismember(G,subs(i));
+        data = X_raw(idx,:);
+
+        mu = mean(data,1);
+        sd = std(data,0,1);
+        sd(sd == 0) = 1;
+
+        X_norm(idx,:) = (data - mu) ./ sd;
+
+    end
+end
+
+function [accuracy,macro_f1,kappa,cm] = classification_metrics(YTrue,YPred)
+
+    class_order = categories(YTrue);
+    cm = confusionmat(YTrue,YPred,'Order',categorical(class_order));
+
+    accuracy = trace(cm) / sum(cm(:));
+
+    precision = diag(cm) ./ (sum(cm,1)' + eps);
+    recall = diag(cm) ./ (sum(cm,2) + eps);
+
+    f1 = 2 * (precision .* recall) ./ (precision + recall + eps);
+    macro_f1 = mean(f1);
+
+    n = sum(cm(:));
+    po = trace(cm) / n;
+    pe = sum(sum(cm,2) .* sum(cm,1)') / n^2;
+
+    kappa = (po - pe) / (1 - pe + eps);
+
+end
